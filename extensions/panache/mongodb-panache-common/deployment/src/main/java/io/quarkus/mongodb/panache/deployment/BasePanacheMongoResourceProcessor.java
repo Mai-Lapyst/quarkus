@@ -69,6 +69,9 @@ public abstract class BasePanacheMongoResourceProcessor {
     public static final DotName BSON_IGNORE = createSimple(BsonIgnore.class.getName());
     public static final DotName BSON_PROPERTY = createSimple(BsonProperty.class.getName());
     public static final DotName MONGO_ENTITY = createSimple(io.quarkus.mongodb.panache.common.MongoEntity.class.getName());
+    public static final DotName MONGO_REFERENCE = createSimple(
+            io.quarkus.mongodb.panache.common.MongoReference.class.getName());
+    public static final DotName OBJECT_ID = createSimple(ObjectId.class.getName());
     public static final DotName PROJECTION_FOR = createSimple(io.quarkus.mongodb.panache.common.ProjectionFor.class.getName());
     public static final String BSON_PACKAGE = "org.bson.";
 
@@ -78,7 +81,7 @@ public abstract class BasePanacheMongoResourceProcessor {
             BuildProducer<ReflectiveClassBuildItem> reflectiveClass,
             BuildProducer<ReflectiveHierarchyBuildItem> reflectiveHierarchy,
             BuildProducer<PropertyMappingClassBuildStep> propertyMappingClass,
-            List<PanacheMethodCustomizerBuildItem> methodCustomizersBuildItems) {
+            List<PanacheMethodCustomizerBuildItem> methodCustomizersBuildItems) throws BuildException {
 
         List<PanacheMethodCustomizer> methodCustomizers = methodCustomizersBuildItems.stream()
                 .map(bi -> bi.getMethodCustomizer()).collect(Collectors.toList());
@@ -96,7 +99,7 @@ public abstract class BasePanacheMongoResourceProcessor {
             BuildProducer<ReflectiveHierarchyBuildItem> reflectiveHierarchy,
             BuildProducer<PropertyMappingClassBuildStep> propertyMappingClass,
             BuildProducer<BytecodeTransformerBuildItem> transformers,
-            List<PanacheMethodCustomizerBuildItem> methodCustomizersBuildItems) {
+            List<PanacheMethodCustomizerBuildItem> methodCustomizersBuildItems) throws BuildException {
         List<PanacheMethodCustomizer> methodCustomizers = methodCustomizersBuildItems.stream()
                 .map(bi -> bi.getMethodCustomizer()).collect(Collectors.toList());
 
@@ -254,7 +257,7 @@ public abstract class BasePanacheMongoResourceProcessor {
             BuildProducer<ReflectiveClassBuildItem> reflectiveClass,
             BuildProducer<PropertyMappingClassBuildStep> propertyMappingClass,
             PanacheEntityEnhancer entityEnhancer, TypeBundle typeBundle,
-            MetamodelInfo modelInfo) {
+            MetamodelInfo modelInfo) throws BuildException {
 
         Set<String> modelClasses = new HashSet<>();
         // Note that we do this in two passes because for some reason Jandex does not give us subtypes
@@ -264,11 +267,11 @@ public abstract class BasePanacheMongoResourceProcessor {
                 continue;
             }
             if (modelClasses.add(classInfo.name().toString()))
-                modelInfo.addEntityModel(createEntityModel(classInfo));
+                modelInfo.addEntityModel(createEntityModel(index.getIndex(), classInfo, typeBundle));
         }
         for (ClassInfo classInfo : index.getIndex().getAllKnownSubclasses(typeBundle.entity().dotName())) {
             if (modelClasses.add(classInfo.name().toString()))
-                modelInfo.addEntityModel(createEntityModel(classInfo));
+                modelInfo.addEntityModel(createEntityModel(index.getIndex(), classInfo, typeBundle));
         }
 
         // iterate over all the entity classes
@@ -316,13 +319,141 @@ public abstract class BasePanacheMongoResourceProcessor {
         }
     }
 
-    private EntityModel createEntityModel(ClassInfo classInfo) {
+    private EntityModel createEntityModel(IndexView index, ClassInfo classInfo, TypeBundle typeBundle) throws BuildException {
+        Set<String> referenceFields = new HashSet<>();
+
+        // TODO: test for @MongoReference annotation on non Mongo-Entity classes (?)
+        // TODO: the referenced field extension currently only supports the active-record pattern
+        // TODO: move some of the validity checks from this method into the validate() build step at the end of this class
+        // TODO: add config option to determine if we should reference instead of embedd fields that type extends Mono-Entity classes or have the @MongoEntity annotation
+
         EntityModel entityModel = new EntityModel(classInfo);
         for (FieldInfo fieldInfo : classInfo.fields()) {
             String name = fieldInfo.name();
+
+            if (referenceFields.contains(name)) {
+                // field was already added by the generation of an referenced field!
+                // we test for the correct type
+                if (!fieldInfo.type().name().equals(OBJECT_ID)) {
+                    throw new BuildException("Cannot define field '" + name
+                            + "' with another type as org.bson.types.ObjectId because it is used as reference holder for a referenced field",
+                            Collections.emptyList());
+                }
+
+                if (fieldInfo.hasAnnotation(BSON_IGNORE)) {
+                    throw new BuildException("Cannot annotate field '" + name
+                            + "' with @org.bson.codecs.pojo.annotations.BsonIgnore because it is used as reference holder for a referenced field",
+                            Collections.emptyList());
+                }
+
+                // skip it because it *should* not contain any important data but is just defined so the user can access it while developing
+                continue;
+            }
+
             if (Modifier.isPublic(fieldInfo.flags())
                     && !Modifier.isStatic(fieldInfo.flags())
                     && !fieldInfo.hasAnnotation(BSON_IGNORE)) {
+
+                System.out.printf(
+                        "Create Entity Model for class %s: field '%s' of type '%s' (%s)\n",
+                        classInfo.name(), name, fieldInfo.type().name(), DescriptorUtils.typeToString(fieldInfo.type()));
+                Type t = fieldInfo.type();
+                if (t instanceof org.jboss.jandex.ClassType) {
+                    ClassInfo fieldClassInfo = index.getClassByName(t.name());
+                    if (fieldClassInfo != null) {
+                        boolean extendsMongoEntityBase = fieldClassInfo.superName().equals(typeBundle.entityBase().dotName());
+                        boolean extendsMongoEntity = fieldClassInfo.superName().equals(typeBundle.entity().dotName());
+
+                        if (extendsMongoEntityBase || extendsMongoEntity
+                                || fieldClassInfo.classAnnotation(MONGO_ENTITY) != null) {
+                            // Field's class is an entity, reference it instead of embedding it
+
+                            String fieldname = null;
+                            if (fieldInfo.hasAnnotation(MONGO_REFERENCE)) {
+                                AnnotationInstance ref = fieldInfo.annotation(MONGO_REFERENCE);
+                                fieldname = ref.value("store_in").asString();
+                            }
+                            if (fieldname == null || fieldname.trim().isBlank()) {
+                                fieldname = name + "_id";
+                            }
+
+                            if (referenceFields.contains(fieldname)) {
+                                // already referenced by another field; error
+                                throw new BuildException(
+                                        "Cannot set the name of the field that holds the reference (the id of referenced entity) because another field already uses this name!",
+                                        Collections.emptyList());
+                            }
+
+                            // find the bsonId field from the referenced entity
+                            String bsonIdFieldName = null;
+                            String bsonIdFieldDescriptor = null;
+
+                            if (extendsMongoEntity) {
+                                // this shortcut is possible because mongodb-panache already checks and requires (!) that only one @BsonId is defined
+                                bsonIdFieldName = "id";
+                                bsonIdFieldDescriptor = DescriptorUtils.typeToString(Type.create(OBJECT_ID, Type.Kind.CLASS));
+                            } else {
+                                // NOTE: this uses the first field with @BsonId it finds
+                                for (FieldInfo fieldInf : fieldClassInfo.fields()) {
+                                    if (fieldInf.hasAnnotation(BSON_ID)) {
+                                        bsonIdFieldName = fieldInf.name();
+                                        bsonIdFieldDescriptor = DescriptorUtils.typeToString(fieldInf.type());
+                                        break;
+                                    }
+                                }
+                                if (bsonIdFieldName == null) {
+                                    FieldInfo idFieldInfo = fieldClassInfo.field("id");
+                                    if (idFieldInfo == null) {
+                                        throw new BuildException(
+                                                "Cannot reference the POJO '" + fieldInfo.type().name()
+                                                        + "' because it has no valid id field for mongodb.",
+                                                Collections.emptyList());
+                                    }
+                                    bsonIdFieldName = "id";
+                                    bsonIdFieldDescriptor = DescriptorUtils.typeToString(idFieldInfo.type());
+                                }
+                            }
+
+                            // NOTE: we generate two field here for a couple of reasons:
+                            //         1. we dont need to re-implement the field-to-method replacement code from panache
+
+                            // create a referenced field
+                            ReferencedEntityField entityField = new ReferencedEntityField(
+                                    name, DescriptorUtils.typeToString(fieldInfo.type()),
+                                    fieldname, bsonIdFieldDescriptor, bsonIdFieldName);
+                            entityField.id_field_exists = classInfo.field(fieldname) != null;
+                            entityModel.addField(entityField);
+
+                            // create the field that stores the id
+                            ReferenceEntityField idField = new ReferenceEntityField(
+                                    fieldname, bsonIdFieldDescriptor,
+                                    name, DescriptorUtils.typeToString(fieldInfo.type()), bsonIdFieldName);
+
+                            if (entityModel.fields.containsKey(fieldname)) {
+                                FieldInfo fInfo = classInfo.field(fieldname);
+                                if (!fInfo.type().name().equals(OBJECT_ID)) {
+                                    throw new BuildException("Cannot define field '" + fieldname
+                                            + "' with another type as org.bson.types.ObjectId because it is used as reference holder for a referenced field",
+                                            Collections.emptyList());
+                                }
+
+                                if (fInfo.hasAnnotation(BSON_IGNORE)) {
+                                    throw new BuildException("Cannot annotate field '" + fieldname
+                                            + "' with @org.bson.codecs.pojo.annotations.BsonIgnore because it is used as reference holder for a referenced field",
+                                            Collections.emptyList());
+                                }
+
+                                entityModel.fields.replace(idField.name, idField);
+                            } else {
+                                entityModel.addField(idField);
+                            }
+
+                            referenceFields.add(fieldname);
+                            continue;
+                        }
+                    }
+                }
+
                 entityModel.addField(new EntityField(name, DescriptorUtils.typeToString(fieldInfo.type())));
             }
         }
@@ -374,7 +505,7 @@ public abstract class BasePanacheMongoResourceProcessor {
             BuildProducer<ReflectiveHierarchyBuildItem> reflectiveHierarchy,
             BuildProducer<PropertyMappingClassBuildStep> propertyMappingClass,
             TypeBundle typeBundle, PanacheRepositoryEnhancer repositoryEnhancer,
-            PanacheEntityEnhancer entityEnhancer, MetamodelInfo modelInfo) {
+            PanacheEntityEnhancer entityEnhancer, MetamodelInfo modelInfo) throws BuildException {
         processRepositories(index, transformers, reflectiveHierarchy, propertyMappingClass,
                 repositoryEnhancer, typeBundle);
         processEntities(index, transformers, reflectiveClass, propertyMappingClass,
