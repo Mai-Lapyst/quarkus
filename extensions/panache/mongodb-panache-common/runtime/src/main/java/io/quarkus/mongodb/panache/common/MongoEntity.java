@@ -26,4 +26,9 @@ public @interface MongoEntity {
      * The name of the MongoDB client (if not set the default client will be used).
      */
     String clientName() default "";
+
+    /**
+     * Indexes for the Entity / Collection
+     */
+    MongoIndex[] indexes() default {};
 }

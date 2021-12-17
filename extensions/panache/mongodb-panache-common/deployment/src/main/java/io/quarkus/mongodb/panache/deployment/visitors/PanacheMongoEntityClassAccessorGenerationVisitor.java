@@ -176,7 +176,7 @@ public class PanacheMongoEntityClassAccessorGenerationVisitor extends ClassVisit
                         mv.visitLdcInsn("Detected inconsitency for referenced field: '" + field.name + "."
                                 + field.bsonIdFieldName + "' and '"
                                 + field.id_name + "' dont have the same value");
-                        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, exceptionType.getInternalName(), "<init>",
+                        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, exceptionType.getInternalName(), "<init>",
                                 "(Ljava/lang/String;)V", false);
                         mv.visitInsn(Opcodes.ATHROW);
                     }

@@ -9,6 +9,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,12 +29,14 @@ import org.jboss.jandex.IndexView;
 import org.jboss.jandex.MethodInfo;
 import org.jboss.jandex.Type;
 
+import io.quarkus.arc.deployment.SyntheticBeansRuntimeInitBuildItem;
 import io.quarkus.arc.deployment.ValidationPhaseBuildItem;
 import io.quarkus.bootstrap.classloading.ClassPathElement;
 import io.quarkus.bootstrap.classloading.QuarkusClassLoader;
 import io.quarkus.builder.BuildException;
 import io.quarkus.deployment.annotations.BuildProducer;
 import io.quarkus.deployment.annotations.BuildStep;
+import io.quarkus.deployment.annotations.Consume;
 import io.quarkus.deployment.annotations.ExecutionTime;
 import io.quarkus.deployment.annotations.Record;
 import io.quarkus.deployment.bean.JavaBeanUtil;
@@ -50,6 +53,7 @@ import io.quarkus.jsonb.spi.JsonbDeserializerBuildItem;
 import io.quarkus.jsonb.spi.JsonbSerializerBuildItem;
 import io.quarkus.mongodb.deployment.MongoClientNameBuildItem;
 import io.quarkus.mongodb.deployment.MongoUnremovableClientsBuildItem;
+import io.quarkus.mongodb.panache.common.MongoIndex;
 import io.quarkus.mongodb.panache.common.PanacheMongoRecorder;
 import io.quarkus.mongodb.panache.jackson.ObjectIdDeserializer;
 import io.quarkus.mongodb.panache.jackson.ObjectIdSerializer;
@@ -71,6 +75,7 @@ public abstract class BasePanacheMongoResourceProcessor {
     public static final DotName MONGO_ENTITY = createSimple(io.quarkus.mongodb.panache.common.MongoEntity.class.getName());
     public static final DotName MONGO_REFERENCE = createSimple(
             io.quarkus.mongodb.panache.common.MongoReference.class.getName());
+    public static final DotName MONGO_INDEX = createSimple(io.quarkus.mongodb.panache.common.MongoIndex.class.getName());
     public static final DotName OBJECT_ID = createSimple(ObjectId.class.getName());
     public static final DotName PROJECTION_FOR = createSimple(io.quarkus.mongodb.panache.common.ProjectionFor.class.getName());
     public static final String BSON_PACKAGE = "org.bson.";
@@ -320,7 +325,7 @@ public abstract class BasePanacheMongoResourceProcessor {
     }
 
     private EntityModel createEntityModel(IndexView index, ClassInfo classInfo, TypeBundle typeBundle) throws BuildException {
-        Set<String> referenceFields = new HashSet<>();
+        Map<String, DotName> referenceFields = new HashMap<>();
 
         // TODO: test for @MongoReference annotation on non Mongo-Entity classes (?)
         // TODO: the referenced field extension currently only supports the active-record pattern
@@ -331,12 +336,15 @@ public abstract class BasePanacheMongoResourceProcessor {
         for (FieldInfo fieldInfo : classInfo.fields()) {
             String name = fieldInfo.name();
 
-            if (referenceFields.contains(name)) {
+            if (referenceFields.containsKey(name)) {
+                DotName bsonIdFieldDotName = referenceFields.get(name);
+
                 // field was already added by the generation of an referenced field!
                 // we test for the correct type
-                if (!fieldInfo.type().name().equals(OBJECT_ID)) {
+                if (!fieldInfo.type().name().equals(bsonIdFieldDotName)) {
                     throw new BuildException("Cannot define field '" + name
-                            + "' with another type as org.bson.types.ObjectId because it is used as reference holder for a referenced field",
+                            + "' with another type as " + bsonIdFieldDotName.toString()
+                            + " because it is used as reference holder for a referenced field",
                             Collections.emptyList());
                 }
 
@@ -377,7 +385,7 @@ public abstract class BasePanacheMongoResourceProcessor {
                                 fieldname = name + "_id";
                             }
 
-                            if (referenceFields.contains(fieldname)) {
+                            if (referenceFields.containsKey(fieldname)) {
                                 // already referenced by another field; error
                                 throw new BuildException(
                                         "Cannot set the name of the field that holds the reference (the id of referenced entity) because another field already uses this name!",
@@ -429,11 +437,15 @@ public abstract class BasePanacheMongoResourceProcessor {
                                     fieldname, bsonIdFieldDescriptor,
                                     name, DescriptorUtils.typeToString(fieldInfo.type()), bsonIdFieldName);
 
+                            DotName bsonIdFieldDotName = DotName
+                                    .createSimple(org.objectweb.asm.Type.getType(bsonIdFieldDescriptor).getClassName());
+
                             if (entityModel.fields.containsKey(fieldname)) {
                                 FieldInfo fInfo = classInfo.field(fieldname);
-                                if (!fInfo.type().name().equals(OBJECT_ID)) {
+                                if (!fInfo.type().name().equals(bsonIdFieldDotName)) {
                                     throw new BuildException("Cannot define field '" + fieldname
-                                            + "' with another type as org.bson.types.ObjectId because it is used as reference holder for a referenced field",
+                                            + "' with another type as " + bsonIdFieldDotName.toString()
+                                            + " because it is used as reference holder for a referenced field",
                                             Collections.emptyList());
                                 }
 
@@ -448,7 +460,7 @@ public abstract class BasePanacheMongoResourceProcessor {
                                 entityModel.addField(idField);
                             }
 
-                            referenceFields.add(fieldname);
+                            referenceFields.put(fieldname, bsonIdFieldDotName);
                             continue;
                         }
                     }
@@ -510,6 +522,31 @@ public abstract class BasePanacheMongoResourceProcessor {
                 repositoryEnhancer, typeBundle);
         processEntities(index, transformers, reflectiveClass, propertyMappingClass,
                 entityEnhancer, typeBundle, modelInfo);
+    }
+
+    @BuildStep
+    @Record(ExecutionTime.STATIC_INIT)
+    protected void processMongodbIndexes(List<PropertyMappingClassBuildStep> propertyMappingClasses,
+            CombinedIndexBuildItem index,
+            PanacheMongoRecorder recorder) throws BuildException {
+
+        List<String> entityClassnameList = new LinkedList<>();
+        for (PropertyMappingClassBuildStep classToMap : propertyMappingClasses) {
+            DotName dotName = createSimple(classToMap.getClassName());
+            ClassInfo classInfo = index.getIndex().getClassByName(dotName);
+            if (classInfo != null) {
+                entityClassnameList.add(classToMap.getClassName());
+            }
+        }
+
+        recorder.setEntityClassnameCache(entityClassnameList);
+    }
+
+    @BuildStep
+    @Record(ExecutionTime.RUNTIME_INIT)
+    @Consume(SyntheticBeansRuntimeInitBuildItem.class)
+    protected void ensureMongodbIndexes(PanacheMongoRecorder recorder) {
+        recorder.ensureIndexes();
     }
 
     @BuildStep
