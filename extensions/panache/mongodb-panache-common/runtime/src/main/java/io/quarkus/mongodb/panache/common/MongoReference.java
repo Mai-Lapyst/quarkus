@@ -15,4 +15,14 @@ public @interface MongoReference {
      * The name of the field that should store the reference
      */
     String store_in() default "";
+
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target({})
+    public static @interface TypeMapping {
+        String type();
+
+        String mapped();
+    }
+
+    TypeMapping[] typeMappings() default {};
 }

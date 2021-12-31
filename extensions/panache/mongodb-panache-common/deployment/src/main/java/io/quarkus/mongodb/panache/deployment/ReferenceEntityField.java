@@ -13,6 +13,10 @@ public class ReferenceEntityField extends EntityField {
 
     public final String entity_name;
     public final String entity_descriptor;
+
+    public final boolean isContainerWrapped;
+    public final String real_entity_descriptor;
+
     public String entity_signature;
 
     /**
@@ -21,11 +25,13 @@ public class ReferenceEntityField extends EntityField {
     public final String bsonIdFieldName;
 
     public ReferenceEntityField(String name, String descriptor, String entity_name, String entity_descriptor,
-            String bsonIdFieldName) {
+            String bsonIdFieldName, boolean isContainerWrapped, String real_entity_descriptor) {
         super(name, descriptor);
         this.entity_name = entity_name;
         this.entity_descriptor = entity_descriptor;
         this.bsonIdFieldName = bsonIdFieldName;
+        this.isContainerWrapped = isContainerWrapped;
+        this.real_entity_descriptor = real_entity_descriptor;
     }
 
     public String getReferenceGetterName() {

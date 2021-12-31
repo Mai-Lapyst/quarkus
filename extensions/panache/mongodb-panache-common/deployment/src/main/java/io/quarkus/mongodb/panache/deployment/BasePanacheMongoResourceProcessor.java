@@ -22,11 +22,14 @@ import org.bson.codecs.pojo.annotations.BsonProperty;
 import org.bson.types.ObjectId;
 import org.jboss.jandex.AnnotationInstance;
 import org.jboss.jandex.AnnotationValue;
+import org.jboss.jandex.ArrayType;
 import org.jboss.jandex.ClassInfo;
+import org.jboss.jandex.ClassType;
 import org.jboss.jandex.DotName;
 import org.jboss.jandex.FieldInfo;
 import org.jboss.jandex.IndexView;
 import org.jboss.jandex.MethodInfo;
+import org.jboss.jandex.ParameterizedType;
 import org.jboss.jandex.Type;
 
 import io.quarkus.arc.deployment.SyntheticBeansRuntimeInitBuildItem;
@@ -79,6 +82,18 @@ public abstract class BasePanacheMongoResourceProcessor {
     public static final DotName OBJECT_ID = createSimple(ObjectId.class.getName());
     public static final DotName PROJECTION_FOR = createSimple(io.quarkus.mongodb.panache.common.ProjectionFor.class.getName());
     public static final String BSON_PACKAGE = "org.bson.";
+
+    // public static final DotName ITERABLE = createSimple(java.lang.Iterable.class.getName());
+    public static final DotName JAVA_COLLECTION = createSimple(java.util.Collection.class.getName());
+    public static final DotName JAVA_LIST = createSimple(java.util.List.class.getName());
+    //public static final DotName JAVA_MAP = createSimple(java.util.Map.class.getName());
+    public static final DotName JAVA_OBJECT = createSimple(java.lang.Object.class.getName());
+
+    //public static final DotName JAVA_BYTE = createSimple(java.lang.Byte.class.getName());
+    //public static final DotName JAVA_SHORT = createSimple(java.lang.Short.class.getName());
+    //public static final DotName JAVA_INTEGER = createSimple(java.lang.Integer.class.getName());
+    //public static final DotName JAVA_LONG = createSimple(java.lang.Long.class.getName());
+    //public static final DotName JAVA_STRING = createSimple(java.lang.String.class.getName());
 
     @BuildStep
     public void buildImperative(CombinedIndexBuildItem index,
@@ -272,11 +287,11 @@ public abstract class BasePanacheMongoResourceProcessor {
                 continue;
             }
             if (modelClasses.add(classInfo.name().toString()))
-                modelInfo.addEntityModel(createEntityModel(index.getIndex(), classInfo, typeBundle));
+                modelInfo.addEntityModel(createEntityModel(index, classInfo, typeBundle));
         }
         for (ClassInfo classInfo : index.getIndex().getAllKnownSubclasses(typeBundle.entity().dotName())) {
             if (modelClasses.add(classInfo.name().toString()))
-                modelInfo.addEntityModel(createEntityModel(index.getIndex(), classInfo, typeBundle));
+                modelInfo.addEntityModel(createEntityModel(index, classInfo, typeBundle));
         }
 
         // iterate over all the entity classes
@@ -324,7 +339,168 @@ public abstract class BasePanacheMongoResourceProcessor {
         }
     }
 
-    private EntityModel createEntityModel(IndexView index, ClassInfo classInfo, TypeBundle typeBundle) throws BuildException {
+    private boolean findTypeInSupertypes(DotName search, Type searchIn, CombinedIndexBuildItem index) {
+        Type currentType = searchIn;
+        //System.out.printf("findTypeInSupertypes(): search='%s'; searchIn='%s'\n", search, searchIn.name());
+        while (currentType != null && !currentType.name().equals(JAVA_OBJECT)) {
+            //System.out.printf("findTypeInSupertypes(): - currentType: %s\n", currentType.name());
+            if (currentType.name().equals(search)) {
+                return true;
+            }
+            ClassInfo classInfo = index.getIndex().getClassByName(currentType.name());
+            if (classInfo == null) {
+                classInfo = index.getComputingIndex().getClassByName(currentType.name());
+                if (classInfo == null) {
+                    break;
+                }
+            }
+            for (Type interfaceType : classInfo.interfaceTypes()) {
+                //System.out.printf("findTypeInSupertypes():   - interface %s (%s)\n", interfaceType.name(),
+                //        interfaceType.getClass().getName());
+                if (interfaceType.name().equals(search)) {
+                    return true;
+                }
+                if (findTypeInSupertypes(search, interfaceType, index)) {
+                    return true;
+                }
+            }
+            currentType = classInfo.superClassType();
+        }
+        return false;
+    }
+
+    // private boolean isPrimitiveClassType(Type type) {
+    //     if (!(type instanceof ClassType)) {
+    //         return false;
+    //     }
+    //     DotName name = type.name();
+    //     return name.equals(JAVA_BYTE) || name.equals(JAVA_SHORT) || name.equals(JAVA_INTEGER) || name.equals(JAVA_LONG)
+    //             || name.equals(JAVA_STRING);
+    // }
+
+    public static class EntityCheckResult {
+        public final Type entityType;
+        public final boolean isContainerWrapped;
+        public final boolean hasPredefinedIdField;
+
+        public EntityCheckResult(Type t, boolean b1, boolean b2) {
+            this.entityType = t;
+            this.isContainerWrapped = b1;
+            this.hasPredefinedIdField = b2;
+        }
+    }
+
+    private EntityCheckResult checkIfTypeIsEntity(Type typeToCheck, CombinedIndexBuildItem index, TypeBundle typeBundle) {
+        Type entityType = typeToCheck;
+        boolean isContainerWrapped = false;
+        boolean hasPredefinedIdField = false;
+        while (true) {
+            System.out.printf("- test %s for entitytype...\n", entityType.name());
+            if (entityType instanceof ArrayType) {
+                isContainerWrapped = true;
+                entityType = entityType.asArrayType().component();
+                continue;
+            } else if (entityType instanceof ParameterizedType) {
+                // TODO: types like 'Y<String>.X' where X might be a entity to reference are NOT supported
+
+                ParameterizedType genericType = (ParameterizedType) entityType;
+
+                // check if type itself is one of out list-ish interfaces
+                // findTypeInSupertypes(JAVA_COLLECTION, entityType, index)
+                // entityType.name().equals(JAVA_COLLECTION)
+                if (entityType.name().equals(JAVA_LIST)) {
+                    isContainerWrapped = true;
+                    entityType = genericType.arguments().get(0);
+                    continue;
+                    // } else if (entityType.name().equals(JAVA_MAP) || findTypeInSupertypes(JAVA_MAP, entityType, index)) {
+                    //     Type keyType = genericType.arguments().get(0);
+                    //     if (keyType instanceof PrimitiveType || isPrimitiveClassType(keyType)) {
+                    //         isContainerWrapped = true;
+                    //         entityType = genericType.arguments().get(1);
+                    //         continue;
+                    //     } else if (keyType instanceof ClassType) {
+                    //         EntityCheckResult result = this.checkIfTypeIsEntity(keyType, index, typeBundle)
+                    //     } else {
+                    //         entityType = null;
+                    //         break;
+                    //     }
+                } else {
+                    entityType = null;
+                    break;
+                }
+            } else if (entityType instanceof ClassType) {
+                ClassInfo cInfo = index.getIndex().getClassByName(entityType.name());
+                if (cInfo == null) {
+                    // class seems not in the jandex index... ignore it
+                    entityType = null;
+                    break;
+                }
+                if (cInfo.superName() == null) {
+                    entityType = null;
+                    break;
+                }
+                boolean extendsMongoEntity = cInfo.superName().equals(typeBundle.entity().dotName());
+                if (cInfo.superName().equals(typeBundle.entityBase().dotName()) || extendsMongoEntity) {
+                    isContainerWrapped = true;
+                    hasPredefinedIdField = extendsMongoEntity;
+                    break;
+                } else {
+                    entityType = null;
+                    break;
+                }
+            } else {
+                entityType = null;
+                break;
+            }
+        }
+        System.out.printf("=> found entitytype: %s\n", entityType == null ? "null" : entityType.name());
+        return new EntityCheckResult(entityType, isContainerWrapped, hasPredefinedIdField);
+    }
+
+    private Type createReferenceType(Type containerOrEntityType, Type entityType, DotName idFieldDotName,
+            CombinedIndexBuildItem index, Map<String, String> typeMappings) throws BuildException {
+        if (containerOrEntityType instanceof ArrayType) {
+            ArrayType arrayType = containerOrEntityType.asArrayType();
+            Type type = createReferenceType(arrayType.component(), entityType, idFieldDotName, index, typeMappings);
+            return ArrayType.create(type, arrayType.dimensions());
+        } else if (containerOrEntityType instanceof ParameterizedType) {
+            ParameterizedType genericType = containerOrEntityType.asParameterizedType();
+
+            ClassInfo classInfo = index.getIndex().getClassByName(genericType.name());
+            if (classInfo == null) {
+                classInfo = index.getComputingIndex().getClassByName(genericType.name());
+            }
+            if (Modifier.isInterface(classInfo.flags()) || Modifier.isAbstract(classInfo.flags())) {
+                // need explicit type for creation
+                Type t = Type.create(genericType.name(), Type.Kind.CLASS);
+                if (!typeMappings.containsKey(DescriptorUtils.typeToString(t))) {
+                    throw new BuildException(
+                            "Referenced field needs explicit mapping to create-able class for '" + genericType.name() + "'",
+                            Collections.emptyList());
+                }
+            }
+
+            // findTypeInSupertypes(JAVA_COLLECTION, genericType, index)
+            if (genericType.name().equals(JAVA_COLLECTION) || genericType.name().equals(JAVA_LIST)) {
+                Type t = createReferenceType(genericType.arguments().get(0), entityType, idFieldDotName, index, typeMappings);
+                return ParameterizedType.create(genericType.name(), new Type[] { t }, genericType.owner());
+            }
+            // else if (genericType.name().equals(JAVA_MAP) || findTypeInSupertypes(JAVA_MAP, genericType, index)) {
+            //     Type keyType = genericType.arguments().get(0);
+            //     Type valueType = createReferenceType(genericType.arguments().get(1), entityType, idFieldDotName, index,
+            //             typeMappings);
+            //     return ParameterizedType.create(genericType.name(), new Type[] { keyType, valueType }, genericType.owner());
+            // }
+        } else {
+            if (containerOrEntityType == entityType) {
+                return Type.create(idFieldDotName, Type.Kind.CLASS);
+            }
+        }
+        return null;
+    }
+
+    private EntityModel createEntityModel(CombinedIndexBuildItem index, ClassInfo classInfo, TypeBundle typeBundle)
+            throws BuildException {
         Map<String, DotName> referenceFields = new HashMap<>();
 
         // TODO: test for @MongoReference annotation on non Mongo-Entity classes (?)
@@ -365,9 +541,11 @@ public abstract class BasePanacheMongoResourceProcessor {
                 System.out.printf(
                         "Create Entity Model for class %s: field '%s' of type '%s' (%s)\n",
                         classInfo.name(), name, fieldInfo.type().name(), DescriptorUtils.typeToString(fieldInfo.type()));
-                Type t = fieldInfo.type();
-                if (t instanceof org.jboss.jandex.ClassType) {
-                    ClassInfo fieldClassInfo = index.getClassByName(t.name());
+
+                Type fieldType = fieldInfo.type();
+                EntityCheckResult result = checkIfTypeIsEntity(fieldType, index, typeBundle);
+                if (result.entityType != null) {
+                    ClassInfo fieldClassInfo = index.getIndex().getClassByName(result.entityType.name());
                     if (fieldClassInfo != null) {
                         boolean extendsMongoEntityBase = fieldClassInfo.superName().equals(typeBundle.entityBase().dotName());
                         boolean extendsMongoEntity = fieldClassInfo.superName().equals(typeBundle.entity().dotName());
@@ -377,9 +555,25 @@ public abstract class BasePanacheMongoResourceProcessor {
                             // Field's class is an entity, reference it instead of embedding it
 
                             String fieldname = null;
+                            Map<String, String> typeMappings = new HashMap<>();
                             if (fieldInfo.hasAnnotation(MONGO_REFERENCE)) {
                                 AnnotationInstance ref = fieldInfo.annotation(MONGO_REFERENCE);
-                                fieldname = ref.value("store_in").asString();
+                                if (ref.value("store_in") != null) {
+                                    fieldname = ref.value("store_in").asString();
+                                }
+
+                                if (ref.value("typeMappings") != null) {
+                                    for (AnnotationInstance mapping : ref.value("typeMappings").asNestedArray()) {
+                                        if (mapping.value("type") != null && mapping.value("mapped") != null) {
+                                            Type type = Type.create(DotName.createSimple(mapping.value("type").asString()),
+                                                    Type.Kind.CLASS);
+                                            Type mapped = Type.create(DotName.createSimple(mapping.value("mapped").asString()),
+                                                    Type.Kind.CLASS);
+                                            typeMappings.put(DescriptorUtils.typeToString(type),
+                                                    DescriptorUtils.typeToString(mapped));
+                                        }
+                                    }
+                                }
                             }
                             if (fieldname == null || fieldname.trim().isBlank()) {
                                 fieldname = name + "_id";
@@ -396,7 +590,7 @@ public abstract class BasePanacheMongoResourceProcessor {
                             String bsonIdFieldName = null;
                             String bsonIdFieldDescriptor = null;
 
-                            if (extendsMongoEntity) {
+                            if (extendsMongoEntity || result.hasPredefinedIdField) {
                                 // this shortcut is possible because mongodb-panache already checks and requires (!) that only one @BsonId is defined
                                 bsonIdFieldName = "id";
                                 bsonIdFieldDescriptor = DescriptorUtils.typeToString(Type.create(OBJECT_ID, Type.Kind.CLASS));
@@ -422,23 +616,31 @@ public abstract class BasePanacheMongoResourceProcessor {
                                 }
                             }
 
+                            DotName bsonIdFieldDotName = DotName
+                                    .createSimple(org.objectweb.asm.Type.getType(bsonIdFieldDescriptor).getClassName());
+
+                            // generate referenceField descriptor based on the fieldType and the bsonIdFieldDescriptor
+                            Type referenceFieldType = createReferenceType(fieldType, result.entityType, bsonIdFieldDotName,
+                                    index,
+                                    typeMappings);
+                            String referenceFieldDescriptor = DescriptorUtils.typeToString(referenceFieldType);
+
                             // NOTE: we generate two field here for a couple of reasons:
                             //         1. we dont need to re-implement the field-to-method replacement code from panache
 
                             // create a referenced field
                             ReferencedEntityField entityField = new ReferencedEntityField(
                                     name, DescriptorUtils.typeToString(fieldInfo.type()),
-                                    fieldname, bsonIdFieldDescriptor, bsonIdFieldName);
+                                    fieldname, referenceFieldDescriptor, bsonIdFieldName, result.isContainerWrapped,
+                                    DescriptorUtils.typeToString(result.entityType), typeMappings);
                             entityField.id_field_exists = classInfo.field(fieldname) != null;
                             entityModel.addField(entityField);
 
                             // create the field that stores the id
                             ReferenceEntityField idField = new ReferenceEntityField(
-                                    fieldname, bsonIdFieldDescriptor,
-                                    name, DescriptorUtils.typeToString(fieldInfo.type()), bsonIdFieldName);
-
-                            DotName bsonIdFieldDotName = DotName
-                                    .createSimple(org.objectweb.asm.Type.getType(bsonIdFieldDescriptor).getClassName());
+                                    fieldname, referenceFieldDescriptor,
+                                    name, DescriptorUtils.typeToString(fieldInfo.type()), bsonIdFieldName,
+                                    result.isContainerWrapped, DescriptorUtils.typeToString(result.entityType));
 
                             if (entityModel.fields.containsKey(fieldname)) {
                                 FieldInfo fInfo = classInfo.field(fieldname);
